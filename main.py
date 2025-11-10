@@ -1,9 +1,9 @@
 import os
 import json
-from OCR_mistral import extract_text_from_pdf, extract_text_from_image
-from QARegrex import parse_ocr_text_to_qa_unified
-from Sent_embedding import embed_file
-from evaluation import hybrid_check
+from A_OCR_mistral import extract_text_from_pdf, extract_text_from_image
+from B_Regrex_books import parse_ocr_text_to_qa_unified
+from C_Sent_embedding import embed_file
+from D_Evaluation import hybrid_check
 
 
 def ocr_stage():
