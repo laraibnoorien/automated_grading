@@ -77,16 +77,6 @@ def extract_text_from_pdf(pdf_path):
         os.remove(img_path)
     return all_text
 
-"""if __name__ == "__main__":
-    file_path = input("Enter image or PDF path: ").strip().strip('"').strip("'")
-    if file_path.lower().endswith(".pdf"):
-        result = extract_text_from_pdf(file_path)
-    else:
-        result = extract_text_from_image(file_path)
-    
-    print("\n========= EXTRACTED TEXT =========\n")
-    print(result)
-"""
 #OUTPUT_FILE = "ocr_output.json"
 
 if __name__ == "__main__":

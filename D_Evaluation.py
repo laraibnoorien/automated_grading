@@ -1,136 +1,172 @@
-"""
-evaluation_pipeline_crossrerank.py
-----------------------------------
-Enhanced evaluation with Cross-Encoder re-ranking for maximum accuracy.
-
-Pipeline:
-1️⃣  Bi-encoder (E5) → fast semantic retrieval  
-2️⃣  Cross-encoder (MiniLM) → precise re-ranking of top-K  
-3️⃣  NLI (Roberta) → entailment/neutral/contradiction check  
-4️⃣  Smooth mark calculation  
-5️⃣  Outputs:
-      - hybrid_results.json  (semantic + NLI + rerank)
-      - graded_results.json  (final marks)
-"""
+import os
+import time
+import json
+from collections import defaultdict
 
 import torch
-import json
-import time
-from collections import defaultdict
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# ========== CONFIG ==========
+from B_normalize import full_clean
+
 EMBEDDING_DB_PATH = "embeddings_library.pt"
 TEMP_STUDENT_PATH = "temp_student_embeddings.pt"
 STUDENT_JSON_PATH = "regrex_student_answer.json"
 
 SEMANTIC_MODEL = "intfloat/e5-base-v2"
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-#NLI_MODEL = "microsoft/deberta-v3-base-mnli"
 NLI_MODEL = "roberta-large-mnli"
 
-
 TOP_K = 5
-RE_RANK_TOP_N = 1
-SCORE_THRESHOLD = 0.55
+SCORE_THRESHOLD = 0.0    # keep low, rely on reranker + NLI
 NLI_BATCH_SIZE = 16
-# ============================
 
 if torch.backends.mps.is_available():
     device = torch.device("mps")
-    print("✅ Using Apple Silicon GPU (MPS)")
 elif torch.cuda.is_available():
     device = torch.device("cuda")
-    print("✅ Using NVIDIA GPU (CUDA)")
 else:
     device = torch.device("cpu")
-    print("⚠️ Using CPU (no GPU detected)")
-# ---------- LOADERS ----------
+
+
 def load_student_data():
-    emb_data = torch.load(TEMP_STUDENT_PATH)
+    data = torch.load(TEMP_STUDENT_PATH)
+    student_sents = data["sentences"]
+    student_embeds = data["embeddings"]
     with open(STUDENT_JSON_PATH, "r", encoding="utf-8") as f:
         json_data = json.load(f)
-
-    student_sents = emb_data["sentences"]
-    student_embeds = emb_data["embeddings"]
-    word_counts = [item.get("metadata", {}).get("word_count", len(item.get("answer_parts", "").split())) for item in json_data]
+    word_counts = []
+    for item in json_data:
+        wc = item.get("metadata", {}).get("word_count")
+        if wc is None:
+            # fallback: flatten answer parts length estimate
+            parts = item.get("answer_parts", "")
+            if isinstance(parts, dict):
+                text = " ".join(str(v) for v in parts.values())
+            else:
+                text = str(parts)
+            wc = len(text.split())
+        word_counts.append(wc)
     return student_sents, student_embeds, word_counts
 
 
 def load_library_embeddings(school_type, subject, board=None, class_name=None, category="book"):
-    data = torch.load(EMBEDDING_DB_PATH)
+    db = torch.load(EMBEDDING_DB_PATH)
     if school_type == "school":
-        entries = data[school_type][subject][board][class_name][category]
+        node = db.get(school_type, {}).get(subject, {}).get(board, {}).get(class_name, {})
     else:
-        entries = data[school_type][subject][category]
+        node = db.get(school_type, {}).get(subject, {})
+
+    possible_keys = [category, "reference", "reference_answer", "book", "teacher", "library"]
+    valid_key = next((k for k in possible_keys if k in node and node[k]), None)
+    if not valid_key:
+        raise KeyError(f"No embeddings found for subject '{subject}' (checked {possible_keys})")
+    entries = node[valid_key]
     latest = entries[-1]
-    return latest["sentences"], latest["embeddings"]
+    sentences = latest["sentences"]
+    embeds = latest["embeddings"]
+    return sentences, embeds
 
-# ---------- SEMANTIC SEARCH ----------
+
 def semantic_search(student_embeds, library_embeds, student_sents, library_sents, top_k=TOP_K):
+    student_embeds = student_embeds.to(device) if isinstance(student_embeds, torch.Tensor) else student_embeds
+    library_embeds = library_embeds.to(device) if isinstance(library_embeds, torch.Tensor) else library_embeds
     hits = util.semantic_search(student_embeds, library_embeds, top_k=top_k)
-    results = []
-    for i, query_hits in enumerate(hits):
-        for hit in query_hits:
-            if hit['score'] >= SCORE_THRESHOLD:
-                results.append({
-                    "student_sentence": student_sents[i],
-                    "library_sentence": library_sents[hit['corpus_id']],
-                    "semantic_score": round(float(hit['score']), 3)
+    pairs = []
+    for q_idx, q_hits in enumerate(hits):
+        for h in q_hits:
+            score = float(h["score"])
+            if score >= SCORE_THRESHOLD:
+                pairs.append({
+                    "student_idx": q_idx,
+                    "library_idx": h["corpus_id"],
+                    "student_sentence": student_sents[q_idx],
+                    "library_sentence": library_sents[h["corpus_id"]],
+                    "semantic_score": round(score, 4)
                 })
-    return results
+    return pairs
 
-# ---------- CROSS-ENCODER RE-RANKING ----------
-def rerank_with_crossencoder(matches, cross_encoder):
-    """Re-rank retrieved pairs with a cross-encoder for precision."""
-    print("[*] Re-ranking with Cross-Encoder...")
-    unique_pairs = [(m["student_sentence"], m["library_sentence"]) for m in matches]
-    scores = cross_encoder.predict(unique_pairs, show_progress_bar=True, batch_size=16)
+
+import re
+
+def _clean_for_cross_encoder(text: str) -> str:
+    # remove e5 prefixes and simple markdown/inline code artifacts
+    text = re.sub(r'\b(query|passage)\s*:\s*', '', text, flags=re.IGNORECASE)
+    text = text.replace("**", "")
+    text = text.replace("```", "")
+    text = re.sub(r'`+', "", text)
+    # remove leftover weird punctuation at ends
+    text = re.sub(r'^[\s\-\:\#\*]+', '', text)
+    text = re.sub(r'[\s\-\:\#\*]+$', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def rerank_with_crossencoder(pairs, cross_encoder, batch_size: int = 16):
+    """
+    Clean pairs (strip 'query:'/'passage:' and markdown) then re-rank with cross-encoder.
+    Returns same list with 'cross_score' added and sorted descending.
+    """
+    if not pairs:
+        return []
+
+    cleaned_pairs = [
+        (_clean_for_cross_encoder(p["student_sentence"]),
+         _clean_for_cross_encoder(p["library_sentence"]))
+        for p in pairs
+    ]
+
+    # predict scores (cross_encoder expects list of (query, passage) tuples)
+    scores = cross_encoder.predict(cleaned_pairs, show_progress_bar=True, batch_size=batch_size)
+
     for i, s in enumerate(scores):
-        matches[i]["cross_score"] = round(float(s), 3)
-    # Sort descending by cross_score
-    matches.sort(key=lambda x: x["cross_score"], reverse=True)
-    return matches
+        pairs[i]["cross_score"] = float(s)
 
-# ---------- NLI ----------
+    pairs.sort(key=lambda x: x["cross_score"], reverse=True)
+    return pairs
+
+
 def nli_batch_check(pairs, tokenizer, model, batch_size=NLI_BATCH_SIZE):
     model.to(device)
     model.eval()
-    results = []
-    labels = ['entailment', 'neutral', 'contradiction']
+    mapped = []
+    id2label = {int(k): v.lower() for k, v in model.config.id2label.items()}
 
     for i in range(0, len(pairs), batch_size):
         batch = pairs[i:i + batch_size]
-        premises = [p["library_sentence"] for p in batch]
-        hypotheses = [p["student_sentence"] for p in batch]
-
-        inputs = tokenizer(premises, hypotheses, return_tensors='pt', truncation=True, padding=True, max_length=512).to(device)
+        premises = [full_clean(p["library_sentence"]) for p in batch]
+        hypotheses = [full_clean(p["student_sentence"]) for p in batch]
+        enc = tokenizer(premises, hypotheses, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
         with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = torch.softmax(logits, dim=1).cpu()
-
+            logits = model(**enc).logits
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
         for j, p in enumerate(batch):
             prob_vec = probs[j].tolist()
-            label = labels[int(torch.argmax(probs[j]))]
-            results.append({
+            # map index->label using id2label
+            idx = int(torch.argmax(torch.tensor(prob_vec)))
+            raw_label = id2label.get(idx, "neutral")
+            # normalize probabilities to dict with keys entailment/neutral/contradiction
+            label_probs = {}
+            # find which id corresponds to standard labels
+            # model.config.id2label might be like {0: 'CONTRADICTION',1:'NEUTRAL',2:'ENTAILMENT'}
+            for lid, lab in id2label.items():
+                label_probs[lab] = round(float(prob_vec[int(lid)]), 4)
+            # ensure keys exist
+            entail = label_probs.get("entailment", label_probs.get("entails", 0.0))
+            neut = label_probs.get("neutral", 0.0)
+            contra = label_probs.get("contradiction", 0.0)
+            mapped.append({
                 **p,
-                "nli_label": label,
+                "nli_label": raw_label,
                 "nli_probs": {
-                    "entailment": round(prob_vec[0], 3),
-                    "neutral": round(prob_vec[1], 3),
-                    "contradiction": round(prob_vec[2], 3)
+                    "entailment": round(entail, 4),
+                    "neutral": round(neut, 4),
+                    "contradiction": round(contra, 4)
                 }
             })
-    return results
+    return mapped
 
-# ---------- MARKING ----------
+
 def calculate_marks(hybrid_results, word_counts):
-    """
-    Compute marks per answer safely.
-    Ensures no negatives, scales all model scores to [0,1].
-    """
-    from collections import defaultdict
     grouped = defaultdict(list)
     for r in hybrid_results:
         grouped[r["student_sentence"]].append(r)
@@ -140,67 +176,60 @@ def calculate_marks(hybrid_results, word_counts):
     max_marks = len(grouped)
 
     for idx, (student_ans, matches) in enumerate(grouped.items()):
-        # Pick the best match (cross-encoder preferred)
-        best = max(matches, key=lambda x: x.get("cross_score", x.get("semantic_score", 0)))
-        raw_score = best.get("cross_score", best.get("semantic_score", 0))
-        nli = best.get("nli_label", "neutral")
+        best = max(matches, key=lambda x: x.get("cross_score", x.get("semantic_score", 0.0)))
+        raw = best.get("cross_score", best.get("semantic_score", 0.0))
+        nli_label = best.get("nli_label", "neutral")
         wc = word_counts[idx] if idx < len(word_counts) else 0
 
-        # --- Normalization ---
-        # Convert any [-1,1] or arbitrary range to [0,1]
-        base = (raw_score + 1) / 2 if raw_score < 0 or raw_score > 1 else raw_score
-        base = max(0.0, min(1.0, round(base, 3)))
+        # normalize raw to [0,1]
+        if raw < 0 or raw > 1:
+            base = 1 / (1 + torch.exp(torch.tensor(-raw))).item()  # sigmoid
+        else:
+            base = float(raw)
+        base = max(0.0, min(1.0, round(base, 4)))
 
-        # --- Weighted scoring by NLI ---
-        if nli == "entailment":
+        if nli_label == "entailment" or nli_label == "entails":
             marks = base
-        elif nli == "neutral":
+        elif nli_label == "neutral":
             marks = base * 0.8
-        else:  # contradiction or uncertain
+        else:
             marks = base * 0.3
 
-        # --- Word count penalty / bonus ---
         if wc < 5:
-            marks *= 0.5  # too short
+            marks *= 0.5
         elif wc > 40:
-            marks = min(1.0, marks + 0.1)  # small bonus
+            marks = min(1.0, marks + 0.1)
 
         marks = round(max(0.0, marks), 2)
         total_score += marks
 
         marked.append({
             **best,
-            "raw_score": round(float(raw_score), 3),
+            "raw_score": round(float(raw), 4),
             "normalized_score": base,
             "word_count": wc,
             "marks_awarded": marks
         })
 
-    # --- Final summary ---
     total_score = round(total_score, 2)
     percentage = round((total_score / max_marks) * 100, 2) if max_marks else 0.0
 
-    graded_output = {
+    graded = {
         "total_marks": total_score,
         "max_marks": max_marks,
         "percentage": percentage,
         "answers": marked
     }
+    return graded
 
-    return graded_output["answers"], total_score, max_marks
 
-# ---------- MAIN ----------
 def evaluate_answers(school_type, subject, board=None, class_name=None, category="book"):
-    print("\n=== Evaluation with Cross-Encoder Re-ranking ===")
     t0 = time.time()
-
-    # Load models
     sem_model = SentenceTransformer(SEMANTIC_MODEL, device=device)
     cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device=device)
     nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
     nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL)
 
-    # Load embeddings/data
     student_sents, student_embeds, word_counts = load_student_data()
     library_sents, library_embeds = load_library_embeddings(school_type, subject, board, class_name, category)
 
@@ -209,47 +238,34 @@ def evaluate_answers(school_type, subject, board=None, class_name=None, category
     if not isinstance(library_embeds, torch.Tensor):
         library_embeds = torch.tensor(library_embeds)
 
-    # Step 1: Semantic retrieval
-    print("[*] Semantic search (bi-encoder)...")
-    matches = semantic_search(student_embeds, library_embeds, student_sents, library_sents, top_k=TOP_K)
-    print(f" → {len(matches)} candidate pairs")
+    student_embeds = student_embeds.to(device)
+    library_embeds = library_embeds.to(device)
 
-    # Step 2: Re-rank with Cross-Encoder
-    matches = rerank_with_crossencoder(matches, cross_encoder)
+    pairs = semantic_search(student_embeds, library_embeds, student_sents, library_sents, top_k=TOP_K)
+    if not pairs:
+        print("No semantic matches found.")
+        return {}
 
-    # Step 3: NLI Verification
-    print(f"[*] Running NLI on {len(matches)} pairs...")
-    hybrid_results = nli_batch_check(matches, nli_tokenizer, nli_model, NLI_BATCH_SIZE)
+    pairs = rerank_with_crossencoder(pairs, cross_encoder)
+    hybrid = nli_batch_check(pairs, nli_tokenizer, nli_model, NLI_BATCH_SIZE)
 
-    # Save intermediate
     with open("hybrid_results.json", "w", encoding="utf-8") as f:
-        json.dump(hybrid_results, f, indent=4, ensure_ascii=False)
-    print("✅ hybrid_results.json saved")
+        json.dump(hybrid, f, indent=4, ensure_ascii=False)
 
-    # Step 4: Mark Calculation
-    marked_results, total_score, max_marks = calculate_marks(hybrid_results, word_counts)
-    graded_output = {
-        "total_marks": total_score,
-        "max_marks": max_marks,
-        "percentage": round((total_score / max_marks) * 100, 2) if max_marks else 0.0,
-        "answers": marked_results
-    }
-
+    graded = calculate_marks(hybrid, word_counts)
     with open("graded_results.json", "w", encoding="utf-8") as f:
-        json.dump(graded_output, f, indent=4, ensure_ascii=False)
-    print("✅ graded_results.json saved")
+        json.dump(graded, f, indent=4, ensure_ascii=False)
 
-    print(f"\n🏁 Done in {time.time()-t0:.2f}s — Final Score: {total_score}/{max_marks} ({graded_output['percentage']}%)")
-    return graded_output
+    print(f"Done in {time.time()-t0:.2f}s — Score: {graded['total_marks']}/{graded['max_marks']} ({graded['percentage']}%)")
+    return graded
 
 
-# ---------- CLI ----------
 if __name__ == "__main__":
-    school_type = input("Enter institution type (school/college): ").strip().lower()
-    subject = input("Enter subject: ").strip()
+    school_type = input("school/college: ").strip().lower()
+    subject = input("subject: ").strip()
     if school_type == "school":
-        board = input("Enter board: ").strip()
-        class_name = input("Enter class: ").strip()
+        board = input("board: ").strip()
+        class_name = input("class: ").strip()
     else:
         board = None
         class_name = None
