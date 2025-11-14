@@ -1,124 +1,93 @@
 #!/usr/bin/env python3
 """
-cross_rerank.py
-Automatically reranks NLI-filtered results using a cross-encoder.
-Input  : nli_output.json
-Output : cross_rerank_output.json
+cross_rerank.py (batched cross-encoder reranking)
+- Reads nli_output.json
+- For each student chunk, takes top-N candidates by entailment and runs CrossEncoder in batch
+- Produces cross_rerank_output.json with CE scores attached
 """
-
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
+import math
+import time
 
-from sentence_transformers import CrossEncoder
 import torch
+from sentence_transformers import CrossEncoder
 
+NLI_OUTPUT_PATH = Path("nli_output.json")
+CE_OUTPUT_PATH = Path("cross_rerank_output.json")
 
-# -----------------------------
-# DEVICE CONFIG
-# -----------------------------
+CE_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CE_BATCH = 64
+
 DEVICE = "cpu"
 if torch.backends.mps.is_available():
     DEVICE = "mps"
 elif torch.cuda.is_available():
     DEVICE = "cuda"
 
+print(f"[+] Loading CrossEncoder ({CE_MODEL_NAME}) on {DEVICE} ...")
+ce_model = CrossEncoder(CE_MODEL_NAME, device=DEVICE)
 
-# -----------------------------
-# Load CrossEncoder model
-# -----------------------------
-MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
-print(f"[+] Loading CrossEncoder model on {DEVICE}...")
-model = CrossEncoder(MODEL, device=DEVICE)
+# how many top candidates (after entailment) to run CE on per chunk
+TOP_FOR_CE = 5
 
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
 
-# -----------------------------
-# RERANK FUNCTION
-# -----------------------------
-def rerank(student_answer: str, candidates: List[Dict]):
-    """
-    candidate entry:
-    {
-        "text": "...",
-        "score": float,
-        "nli": {
-            "entailment": float
-        }
-    }
-    """
+def run_rerank():
+    if not NLI_OUTPUT_PATH.exists():
+        raise FileNotFoundError("nli_output.json not found. Run nli_filter.py first.")
 
-    if not candidates:
-        return []
-
-    # CE input
-    pairs = [(student_answer, c["text"]) for c in candidates]
-
-    # model predict
-    ce_scores = model.predict(pairs).tolist()
-
-    # attach scores
-    for c, s in zip(candidates, ce_scores):
-        c["ce_score"] = float(s)
-
-    # final sorting
-    candidates = sorted(
-        candidates,
-        key=lambda x: (x["ce_score"], x["nli"]["entailment"]),
-        reverse=True
-    )
-
-    return candidates
-
-
-# -----------------------------
-# MAIN PIPELINE
-# -----------------------------
-def run_cross_encoder():
-    NLI_FILE = "nli_output.json"
-
-    if not Path(NLI_FILE).exists():
-        print("❌ nli_output.json not found. Run nli_filter.py first.")
-        return
-
-    print(f"[+] Loading NLI results from {NLI_FILE}...")
-    nli_data = json.load(open(NLI_FILE, "r"))
-
+    nli_data = json.load(open(NLI_OUTPUT_PATH, "r", encoding="utf-8"))
     final_output = []
 
-    print("\n[+] Running CrossEncoder reranking for all student answers...")
-
     for item in nli_data:
-        qnum = item["question_number"]
-        student_ans = item["student_answer"]
-        candidates = item["faiss_nli_ranked"]
+        qnum = item.get("question_number")
+        student_chunks = item.get("student_chunks", [])
 
-        print(f"\n======================================================")
-        print(f"Reranking Q{qnum} ...")
-        print("======================================================")
+        out_chunks = []
+        for ch in student_chunks:
+            chunk_text = ch.get("chunk_text")
+            candidates = ch.get("candidates", []) or []
 
-        ranked = rerank(student_ans, candidates)
+            if not candidates:
+                out_chunks.append({
+                    "chunk_index": ch.get("chunk_index"),
+                    "chunk_text": chunk_text,
+                    "reranked": []
+                })
+                continue
 
-        if ranked:
-            best = ranked[0]
-            print(f"[BEST MATCH] CE Score={best['ce_score']:.3f} | Entail={best['nli']['entailment']:.3f}")
-            print(best["text"][:300], "...")
-        else:
-            print("No candidates after reranking.")
+            # take top-K by entailment (fast filter)
+            topk = candidates[:TOP_FOR_CE]
+
+            # prepare pairs for CE
+            pairs = [(chunk_text, c.get("cleaned_text", c.get("text",""))) for c in topk]
+            # run CE in batch (CrossEncoder handles batching internally, but to control memory we can chunk)
+            ce_scores = ce_model.predict(pairs, batch_size=CE_BATCH).tolist()
+
+            # attach CE scores
+            for c, s in zip(topk, ce_scores):
+                c["ce_score"] = float(s)
+
+            # sort by CE score (desc), fallback to entailment
+            topk_sorted = sorted(topk, key=lambda x: (x.get("ce_score", 0), x.get("nli", {}).get("entailment", 0)), reverse=True)
+
+            out_chunks.append({
+                "chunk_index": ch.get("chunk_index"),
+                "chunk_text": chunk_text,
+                "reranked": topk_sorted
+            })
 
         final_output.append({
             "question_number": qnum,
-            "student_answer": student_ans,
-            "reranked_results": ranked,
+            "student_chunks": out_chunks
         })
 
-    # save
-    json.dump(final_output, open("cross_rerank_output.json", "w"), indent=4)
+    json.dump(final_output, open(CE_OUTPUT_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    print(f"[+] Cross-encoder rerank output saved to {CE_OUTPUT_PATH}")
+    return final_output
 
-    print("\n[✔] Cross-encoder results saved to cross_rerank_output.json")
-
-
-# -----------------------------
-# ENTRYPOINT
-# -----------------------------
 if __name__ == "__main__":
-    run_cross_encoder()
+    run_rerank()

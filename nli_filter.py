@@ -1,206 +1,169 @@
 #!/usr/bin/env python3
 """
-nli_filter.py
-Automatically runs NLI on:
-- Every student answer (from regrex_student_answer.json)
-- Their FAISS top matches (using local_faiss_search.py search logic)
+nli_filter.py (batch NLI + retrieval per-chunk)
+- Processes regrex_student_answer.json (student answers must contain "chunks")
+- Uses local_embed_faiss.search_combined() to retrieve candidates (book+reference)
+- Runs NLI in batches for all chunk-candidate pairs
+- Produces 'nli_output.json' (detailed per-chunk candidates with NLI scores)
 """
-
 import json
-from typing import List, Dict
+from pathlib import Path
+from typing import List, Dict, Tuple
+import math
+import time
+
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from pathlib import Path
-from sentence_transformers import SentenceTransformer
-import faiss
 
-# -----------------------------
-# Paths (same as FAISS system)
-# -----------------------------
-FAISS_INDEX_PATH = "./faiss_index.index"
-META_PATH = "./faiss_metadata.json"
-STUDENT_REGREX_PATH = "./regrex_student_answer.json"
-MODEL_CACHE = "./model_cache"
-EMBED_DIM = 768
+# Local modules (from the new FAISS system you already added)
+from C_local_embed import search_combined
+from B_normalize_answer import normalize_text
 
+# -------------------------
+# Config
+# -------------------------
+STUDENT_REGREX_PATH = Path("regrex_student_answer.json")
+NLI_OUTPUT_PATH = Path("nli_output.json")
 
-# -----------------------------
-# Device
-# -----------------------------
+NLI_MODEL = "facebook/bart-large-mnli"
+BATCH_SIZE = 32  # batch size for NLI
 DEVICE = "cpu"
 if torch.backends.mps.is_available():
     DEVICE = "mps"
 elif torch.cuda.is_available():
     DEVICE = "cuda"
 
+# retrieval sizes (user choice)
+BOOK_K = 10
+REF_K = 5
 
-# -----------------------------
-# Load NLI model
-# -----------------------------
-print(f"[+] Loading NLI model ({DEVICE})...")
-NLI_MODEL = "facebook/bart-large-mnli"
+# -------------------------
+# Load model
+# -------------------------
+print(f"[+] Loading NLI model ({NLI_MODEL}) on {DEVICE}...")
 tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
-model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL).to(DEVICE)
-model.eval()
+nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL).to(DEVICE)
+nli_model.eval()
 
+# -------------------------
+# Helpers
+# -------------------------
+LABELS = ["contradiction", "neutral", "entailment"]
 
-# -----------------------------
-# Load embedding model (same as FAISS embedder)
-# -----------------------------
-def load_embedder():
-    if Path(MODEL_CACHE).exists() and any(Path(MODEL_CACHE).iterdir()):
-        m = SentenceTransformer(MODEL_CACHE)
-    else:
-        m = SentenceTransformer("intfloat/e5-base-v2")
-    return m
+def batched_nli(premises: List[str], hypotheses: List[str], batch_size: int = 32) -> List[Dict]:
+    """
+    premises: list of student_chunk strings (hypothesis position in M-NLI will be student? We'll follow: premise=passage, hypothesis=student)
+    hypotheses: list of passage strings
+    returns list of dicts: {"contradiction":..., "neutral":..., "entailment":..., "result": label}
+    NOTE: We use premise=passage, hypothesis=student to match prior convention? Our score uses entailment probability (passage entails student).
+    """
+    results = []
+    assert len(premises) == len(hypotheses)
+    for i in range(0, len(premises), batch_size):
+        batch_p = premises[i:i+batch_size]
+        batch_h = hypotheses[i:i+batch_size]
+        # tokenizer accepts two lists for pair encoding
+        enc = tokenizer(batch_p, batch_h, padding=True, truncation=True, max_length=512, return_tensors="pt")
+        enc = {k: v.to(DEVICE) for k, v in enc.items()}
+        with torch.no_grad():
+            logits = nli_model(**enc).logits  # (batch, 3)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        for p in probs:
+            label_idx = int(np.argmax(p))
+            out = {
+                "contradiction": float(p[0]),
+                "neutral": float(p[1]),
+                "entailment": float(p[2]),
+                "result": LABELS[label_idx]
+            }
+            results.append(out)
+    return results
 
-embedder = load_embedder()
+# -------------------------
+# Main runner
+# -------------------------
+def run_nli_for_all(book_k:int=BOOK_K, ref_k:int=REF_K):
+    if not STUDENT_REGREX_PATH.exists():
+        raise FileNotFoundError("regrex_student_answer.json not found. Run regrex_answer.py first.")
 
+    students = json.load(open(STUDENT_REGREX_PATH, "r", encoding="utf-8"))
+    full_output = []
 
-# -----------------------------
-# Normalize vectors
-# -----------------------------
-def normalize(v):
-    n = np.linalg.norm(v, axis=1, keepdims=True)
-    n[n == 0] = 1
-    return v / n
-
-
-# -----------------------------
-# Load FAISS + metadata safely
-# -----------------------------
-def load_faiss():
-    if not Path(FAISS_INDEX_PATH).exists():
-        raise FileNotFoundError("FAISS index missing. Run local_embed_faiss.py first.")
-    return faiss.read_index(FAISS_INDEX_PATH)
-
-def load_meta():
-    if not Path(META_PATH).exists():
-        raise FileNotFoundError("faiss_metadata.json missing.")
-    return json.load(open(META_PATH))
-
-
-# -----------------------------
-# FAISS search for a single student answer
-# -----------------------------
-def faiss_search_one(text: str, k=5):
-    index = load_faiss()
-    meta = load_meta()
-
-    if index.ntotal == 0:
-        return []
-
-    q = "query: " + text.strip()
-    emb = embedder.encode([q], convert_to_numpy=True)
-    emb = normalize(emb.astype("float32"))
-
-    distances, idxs = index.search(emb, min(k, index.ntotal))
-
-    out = []
-    for i, score in zip(idxs[0], distances[0]):
-        if i >= len(meta):
-            continue
-        m = meta[i].copy()
-        m["score"] = float(score)
-        out.append(m)
-
-    return out
-
-
-# -----------------------------
-# NLI scoring
-# -----------------------------
-def nli_score(student_answer: str, passage: str):
-    """Return entailment / neutral / contradiction prob."""
-    
-    inputs = tokenizer(
-        student_answer,
-        passage,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-    ).to(DEVICE)
-
-    with torch.no_grad():
-        logits = model(**inputs).logits
-
-    probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-    labels = ["contradiction", "neutral", "entailment"]
-
-    return {
-        "result": labels[np.argmax(probs)],
-        "contradiction": float(probs[0]),
-        "neutral": float(probs[1]),
-        "entailment": float(probs[2]),
-    }
-
-
-# -----------------------------
-# Run NLI on FAISS results
-# -----------------------------
-def filter_with_nli(student_text: str, faiss_results: List[Dict]):
-    out = []
-
-    for r in faiss_results:
-        nli = nli_score(student_text, r["text"])
-        r2 = r.copy()
-        r2["nli"] = nli
-        out.append(r2)
-
-    # Sort: highest entailment first
-    out = sorted(out, key=lambda x: x["nli"]["entailment"], reverse=True)
-    return out
-
-
-# -----------------------------
-# MAIN: automatically run for all student answers
-# -----------------------------
-def run_nli_for_all(top_k=5):
-    if not Path(STUDENT_REGREX_PATH).exists():
-        print("❌ regrex_student_answer.json not found.")
-        return
-
-    students = json.load(open(STUDENT_REGREX_PATH))
-
-    final_output = []
-
+    # We'll batch NLI over all chunk-candidate pairs per student to be efficient.
     for ans in students:
         qnum = ans.get("question_number")
-        text = ans.get("answer") or ans.get("raw_answer") or ""
-        text = text.strip()
+        # prefer 'chunks' if present; else build one chunk from 'answer'
+        chunks = ans.get("chunks")
+        if not chunks:
+            raw = ans.get("answer") or ans.get("raw_answer") or ""
+            raw_norm = normalize_text(raw, mode="answer")["normalized"]
+            chunks = [raw_norm] if raw_norm.strip() else []
 
-        print("\n" + "="*70)
-        print(f"QUESTION {qnum} — Running FAISS + NLI")
-        print("="*70)
-
-        faiss_hits = faiss_search_one(text, k=top_k)
-
-        if not faiss_hits:
-            print("No FAISS matches found.\n")
-            continue
-
-        ranked = filter_with_nli(text, faiss_hits)
-
-        final_output.append({
+        student_entry = {
             "question_number": qnum,
-            "student_answer": text,
-            "faiss_nli_ranked": ranked,
-        })
+            "student_chunks": [],
+            "chunk_count": len(chunks)
+        }
 
-        # Print top result
-        best = ranked[0]
-        print(f"\nBest match (entailment={best['nli']['entailment']:.3f}):")
-        print(best["text"][:300], "...")
+        print(f"[Q{qnum}] processing {len(chunks)} chunks...")
 
-    # Save final NLI output
-    json.dump(final_output, open("nli_output.json", "w"), indent=4)
+        for ci, chunk in enumerate(chunks):
+            chunk_text = chunk.strip()
+            if not chunk_text:
+                continue
 
-    print("\n\n[✔] NLI results saved to nli_output.json")
+            # retrieve combined results (reference + book)
+            candidates = search_combined(chunk_text, k_book=book_k, k_ref=ref_k)
+            # dedupe candidates by id while keeping order
+            seen = set()
+            deduped = []
+            for c in candidates:
+                cid = c.get("id")
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                deduped.append(c)
+
+            # prepare NLI batch pairs: premise=passage_text, hypothesis=student_chunk
+            premises = [c.get("cleaned_text", c.get("text","")) for c in deduped]
+            hypotheses = [chunk_text for _ in premises]
+
+            if not premises:
+                student_entry["student_chunks"].append({
+                    "chunk_index": ci,
+                    "chunk_text": chunk_text,
+                    "candidates": [],
+                    "note": "no candidates"
+                })
+                continue
+
+            # run NLI in batches
+            nli_results = batched_nli(premises, hypotheses, batch_size=BATCH_SIZE)
+
+            # attach NLI scores to candidates
+            candidates_with_nli = []
+            for c, nli in zip(deduped, nli_results):
+                c2 = c.copy()
+                c2["nli"] = nli
+                candidates_with_nli.append(c2)
+
+            # sort by entailment prob desc
+            candidates_with_nli.sort(key=lambda x: x["nli"]["entailment"], reverse=True)
+
+            student_entry["student_chunks"].append({
+                "chunk_index": ci,
+                "chunk_text": chunk_text,
+                "candidates": candidates_with_nli
+            })
+
+        full_output.append(student_entry)
+
+    # save
+    json.dump(full_output, open(NLI_OUTPUT_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    print(f"[+] NLI output saved to {NLI_OUTPUT_PATH}")
+    return full_output
 
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
 if __name__ == "__main__":
-    run_nli_for_all(top_k=5)
+    run_nli_for_all()
