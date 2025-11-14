@@ -1,118 +1,137 @@
 import re
 import json
 from nltk.tokenize import sent_tokenize
-from B_normalize import full_clean
+from B_normalize_book import normalize_book_text
 
-def clean_line(text):
-    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)   # remove images
-    text = re.sub(r'\*{1,2}', '', text)
+# ======================================================
+# CHUNKER — optimal for FAISS + NLI + Cross-Encoder
+# ======================================================
+def chunk_text(text, max_words=45, overlap=10):
     text = text.strip()
-    return text
+    if not text:
+        return []
 
-def chunk_text(text, max_words=100, overlap=20):
     sentences = sent_tokenize(text)
     chunks, current = [], []
     count = 0
+
     for sent in sentences:
         words = sent.split()
         ln = len(words)
+
         if count + ln > max_words and current:
             chunks.append(" ".join(current))
-            overlap_words = " ".join(current).split()[-overlap:]
-            current = overlap_words[:] if overlap_words else []
+
+            tail = " ".join(current).split()[-overlap:]
+            current = tail[:] if tail else []
             count = len(current)
+
         current.append(sent)
         count += ln
+
     if current:
         chunks.append(" ".join(current))
+
     return chunks
 
-def parse_book_ocr(input_file, output_file="regrex_book.json", chunk_size=100):
-    with open(input_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
 
-    if isinstance(data, dict) and "extracted_text" in data:
-        raw_text = data["extracted_text"]
-    elif isinstance(data, list):
-        raw_text = " ".join(item.get("text", "") for item in data)
-    else:
-        raise ValueError("Invalid OCR JSON format")
+# ======================================================
+# SMART HEADING PATTERNS (covers 99% NCERT/CBSE books)
+# ======================================================
+HEADING_PATTERNS = [
+    r"^chapter\s+\d+",
+    r"^\d+\s*[\.:]\s+[A-Z].+",
+    r"^\d+\.\d+\s+[A-Z].+",
+    r"^\d+\.\d+\.\d+\s+[A-Z].+",
+    r"^matter in .*",  
+    r"^activity\s*\d+",
+    r"^exercises?$",
+    r"^exercise\s*\d+",
+    r"^summary$",
+    r"^group activity$",
+    r"^introduction$",
+]
 
-    text = full_clean(raw_text)
+def looks_like_heading(line):
+    t = line.strip()
+    for p in HEADING_PATTERNS:
+        if re.match(p, t, flags=re.IGNORECASE):
+            return True
+    return False
 
-    # use sentence-like split first, fall back to newline when sentences are too long
-    paragraphs = re.split(r'\n{1,}', text)
-    if len(paragraphs) == 1:
-        paragraphs = re.split(r'(?<=[\.!?])\s+', text)
 
-    structured = []
-    intro_buffer = []
-    current_chapter = None
-    current_topic = None
+# ======================================================
+# MAIN BOOK PARSER
+# ======================================================
+def parse_book_ocr_text(text):
 
-    for para in paragraphs:
-        line = clean_line(para).strip()
-        if not line:
+    lines = text.split("\n")
+    sections = []
+    current_title = None
+    current_content = []
+
+    for line in lines:
+        clean = line.strip()
+        if not clean:
             continue
 
-        chapter_match = re.match(r'chapter\s*\d+[:\-\s]*?(.*)', line, re.IGNORECASE)
-        if chapter_match:
-            if intro_buffer:
-                structured.append({
-                    "chapter_title": "Intro / Preface",
-                    "topics": [{"topic_title": "General Intro", "content": " ".join(intro_buffer).strip()}]
-                })
-                intro_buffer = []
-            chapter_title = "chapter " + re.sub(r'chapter\s*', '', chapter_match.group(0), flags=re.IGNORECASE).strip()
-            current_chapter = {"chapter_title": chapter_title, "topics": []}
-            structured.append(current_chapter)
-            current_topic = None
-            continue
+        # detect headings
+        if looks_like_heading(clean):
+            if current_title and current_content:
+                content = "\n".join(current_content).strip()
+                sections.append((current_title, content))
 
-        heading_match = re.match(r'(^#{1,3}\s*(.*))|(^topic[:\-\s]*(.*))|(^section[:\-\s]*(.*))', line, re.IGNORECASE)
-        if heading_match:
-            # pick whichever captured group has content
-            title = next((g for g in heading_match.groups() if g and not g.startswith('#')), None)
-            if not title:
-                title = re.sub(r'^#{1,3}\s*', '', line).strip()
-            topic_title = title.strip()
-            current_topic = {"topic_title": topic_title, "content": ""}
-            if current_chapter is not None:
-                current_chapter["topics"].append(current_topic)
-            else:
-                # if no chapter yet, put into intro as a pseudo-chapter
-                if not structured or structured[-1].get("chapter_title") != "Intro / Preface":
-                    structured.append({
-                        "chapter_title": "Intro / Preface",
-                        "topics": []
-                    })
-                structured[-1]["topics"].append(current_topic)
-            continue
-
-        if current_chapter:
-            if current_topic is None:
-                current_topic = {"topic_title": "", "content": ""}
-                current_chapter["topics"].append(current_topic)
-            current_topic["content"] += " " + line
+            current_title = clean
+            current_content = []
         else:
-            intro_buffer.append(line)
+            current_content.append(clean)
 
-    if intro_buffer:
-        structured.append({
-            "chapter_title": "Intro / Preface",
-            "topics": [{"topic_title": "General Intro", "content": " ".join(intro_buffer).strip()}]
+    # save final section
+    if current_title and current_content:
+        content = "\n".join(current_content).strip()
+        sections.append((current_title, content))
+
+    # Fallback if nothing matched
+    if not sections:
+        sections = [("Book Content", text)]
+
+    # Build topics list
+    topics = []
+    for title, content in sections:
+        topics.append({
+            "topic_title": title.strip(),
+            "content": content,
+            "chunks": chunk_text(content)
         })
 
-    for chapter in structured:
-        for topic in chapter.get("topics", []):
-            content = topic.get("content", "").strip()
-            topic["chunks"] = chunk_text(content, chunk_size, overlap=20) if content else []
-            topic["content"] = content
+    return topics
+
+
+# ======================================================
+# WRAPPER
+# ======================================================
+def parse_book_ocr(input_file, output_file="regrex_book.json"):
+    with open(input_file, "r", encoding="utf-8") as f:
+        raw = json.load(f).get("extracted_text", "")
+
+    if not raw:
+        raise ValueError("Missing 'extracted_text' field")
+
+    # CLEAN OCR TEXT
+    text = normalize_book_text(raw)
+
+    topics = parse_book_ocr_text(text)
+
+    output = [{
+        "chapter_title": "OCR Book",
+        "topics": topics
+    }]
 
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(structured, f, indent=4, ensure_ascii=False)
+        json.dump(output, f, indent=4, ensure_ascii=False)
 
-    print(f"✔ Parsed {len(structured)} chapters saved to {output_file}")
+    print(f"✔ Saved {output_file}")
+
 
 if __name__ == "__main__":
     parse_book_ocr("OCR_Book.json")

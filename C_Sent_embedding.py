@@ -10,7 +10,7 @@ import json
 import torch
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
-from B_normalize import full_clean
+from B_normalize_answer import full_clean
 
 # -------- CONFIG --------
 MODEL_NAME = "intfloat/e5-base-v2"

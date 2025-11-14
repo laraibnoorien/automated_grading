@@ -7,7 +7,7 @@ import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-from B_normalize import full_clean
+from B_normalize_answer import full_clean
 
 EMBEDDING_DB_PATH = "embeddings_library.pt"
 TEMP_STUDENT_PATH = "temp_student_embeddings.pt"
